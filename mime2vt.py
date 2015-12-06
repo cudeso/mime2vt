@@ -5,7 +5,7 @@
 # Author: Xavier Mertens <xavier@rootshell.be>
 # Copyright: GPLv3 (http://gplv3.fsf.org/)
 # Feel free to use the code, but please share the changes you've made
-# 
+#
 
 import argparse
 import ConfigParser
@@ -38,7 +38,7 @@ except:
 
 args = ''
 
-# Default configuration 
+# Default configuration
 config = {
 	'apiKey': '',
 	'esServer': '',
@@ -80,39 +80,45 @@ def dbCreate():
 def dbMD5Exists(md5):
 	""" Search for a MD5 hash in the database"""
 	""" (Return "1" if found) """
-	if not md5:
-		return 1
+	if config['dbSkip'] == "True":
+		return False
+	else:
+		if not md5:
+			return 1
 
-	try:
-		db = sqlite3.connect(config['dbPath'])
-	except:
-		writeLog("Cannot open the database file (locked?)")
-		return 0
-	cursor = db.cursor()
-	cursor.execute('''SELECT md5 FROM files WHERE md5=?''', (md5,))
-	if cursor.fetchone():
+		try:
+			db = sqlite3.connect(config['dbPath'])
+		except:
+			writeLog("Cannot open the database file (locked?)")
+			return 0
+		cursor = db.cursor()
+		cursor.execute('''SELECT md5 FROM files WHERE md5=?''', (md5,))
+		if cursor.fetchone():
+			db.close()
+			return 1
 		db.close()
-		return 1
-	db.close()
-	return 0
+		return 0
 
 def dbAddMD5(md5, filename):
 	""" Store a new MD5 hash in the database """
-	if not md5 or not filename:
+	if config['dbSkip'] == "True":
+		return False
+	else:
+		if not md5 or not filename:
+			return 0
+		try:
+			db = sqlite3.connect(config['dbPath'])
+		except:
+			writeLog("Cannot open the database file (locked?)")
+			return 0
+		cursor = db.cursor()
+		cursor.execute('''INSERT INTO files(md5,filename) VALUES(?,?)''', (md5,filename,))
+		db.commit()
+		db.close()
+		writeLog("DEBUG: dbAddMD5: %s" % md5)
 		return 0
-	try:
-		db = sqlite3.connect(config['dbPath'])
-	except:
-		writeLog("Cannot open the database file (locked?)")
-		return 0
-	cursor = db.cursor()
-	cursor.execute('''INSERT INTO files(md5,filename) VALUES(?,?)''', (md5,filename,))
-	db.commit()
-	db.close()
-	writeLog("DEBUG: dbAddMD5: %s" % md5)
-	return 0
 
-def submit2vt(filename):
+def submit2vt(filename, mailheaders=None):
 
 	"""Submit a new file to VT for scanning"""
 
@@ -128,8 +134,8 @@ def submit2vt(filename):
 	if config['esServer']:
 		# Save results to Elasticsearch
 		try:
-			response['@timestamp'] = time.strftime("%Y-%m-%dT%H:%M:%S+01:00")
-			res = es.index(index=config['esIndex'], doc_type="VTresult", body=json.dumps(response))
+			response = extendResponse(response, filename, mailheaders)
+			res = es.index(index=config['esIndex'], doc_type=config['esDoctype'], body=json.dumps(response))
 		except:
 			writeLog("Cannot index to Elasticsearch")
 	return
@@ -217,8 +223,9 @@ def processZipFile(filename):
 		if config['esServer']:
 			# Save results to Elasticsearch
 			try:
-				response['@timestamp'] = time.strftime("%Y-%m-%dT%H:%M:%S+01:00")
-				res = es.index(index=config['esIndex'], doc_type="VTresult", body=json.dumps(response))
+				response['@timestamp'] = buildTimestamp()
+				response['timestamp'] = response['@timestamp']
+				res = es.index(index=config['esIndex'], doc_type=config['esDoctype'], body=json.dumps(response))
 			except:
 				writeLog("Cannot index to Elasticsearch")
 		writeLog("DEBUG: Step1")
@@ -249,6 +256,11 @@ def processZipFile(filename):
 		parseOLEDocument(os.path.join(generateDumpDirectory(args.directory), filename))
 	return
 
+def buildTimestamp():
+	#return time.strftime("%Y-%m-%dT%H:%M:%S+01:00")
+	#return time.strftime("%Y-%m-%dT%H:%M:%S.341Z")
+	return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
+
 def parseMailheaders(data):
 
 	"""Extract useful e-mail headers"""
@@ -276,6 +288,30 @@ def parseMailheaders(data):
 		return mailheaders
 	else:
 		return None
+
+def extendResponse(response, filename=None, mailheaders=None, MHN=True):
+	if response:
+		response['@timestamp'] = buildTimestamp()
+		response['timestamp'] = response['@timestamp']
+		response['filename'] = filename
+		response['mail'] = mailheaders
+
+		if MHN:
+			response["app"] = config['mhnApp']
+			response["direction"] = "inbound"
+			response["protocol"] = "ip"
+			response["transport"] = "tcp"
+			response["vendor_product"] = config['mhnVendor_product']
+			response["dest_port"] = config['mhnDest_port']
+			response["ids_type"] = config['mhnIds_type']
+			response["dest_ip"] = config['mhnDest_ip']
+			response["src_ip"] = mailheaders["ip"]
+
+		return response
+	else:
+		return None
+
+
 
 def main():
 	global args
@@ -320,7 +356,18 @@ def main():
 		# Elasticsearch config
 		config['esServer'] = c.get('elasticsearch', 'server')
 		config['esIndex'] = c.get('elasticsearch', 'index')
+		config['esIndex'] = config['esIndex'] + "-" + time.strftime("%Y%m%d%H00")
+		config['esDoctype'] = c.get('elasticsearch', 'doctype')
+
 		config['dbPath'] = c.get('database', 'dbpath')
+		config['dbSkip'] = c.get('database', 'skip')
+
+		config['mhnDest_ip'] = c.get('MHN', 'dest_ip')
+		config['mhnDest_port'] = c.get('MHN', 'dest_port')
+		config['mhnApp'] = c.get('MHN', 'app')
+		config['mhnVendor_product'] = c.get('MHN', 'vendor_product')
+		config['mhnIds_type'] = c.get('MHN', 'ids_type')
+
 	except OSError as e:
 		writeLog('Cannot read config file %s: %s' % (args.config_file, e.errno))
 		exit
@@ -407,10 +454,9 @@ def main():
 					# Save results to Elasticsearch
 					if config['esServer']:
 						try:
-							response['@timestamp'] = time.strftime("%Y-%m-%dT%H:%M:%S+01:00")
-							response['filename'] = filename
-							response['mail'] = mailheaders							
-							res = es.index(index=config['esIndex'], doc_type="VTresult", body=json.dumps(response))
+							response = extendResponse(response, filename, mailheaders)
+							res = es.index(index=config['esIndex'], doc_type=config['esDoctype'], body=json.dumps(response))
+							writeLog("Submit ES")
 						except:
 							writeLog("Cannot index to Elasticsearch")
 
@@ -428,7 +474,7 @@ def main():
 							writeLog('File: %s (%s) Score: %s/%s Scanned: %s (%s)' %
 								(filename, md5, positives, total, scan_date, timeDiff(scan_date)))
 						else:
-							submit2vt(os.path.join(generateDumpDirectory(args.directory), filename))
+							submit2vt(os.path.join(generateDumpDirectory(args.directory), filename), mailheaders)
 							writeLog('File: %s (%s) not found, submited for scanning' %
 								(filename, md5))
 						dbAddMD5(md5,filename)
