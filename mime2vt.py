@@ -196,7 +196,7 @@ def parseOLEDocument(f):
 		writeLog('DEBUG: No VBA Macros found')
 	return
 
-def processZipFile(filename):
+def processZipFile(filename, mailheaders=None):
 
 	"""Extract files from a ZIP archive and test them against VT"""
 
@@ -223,8 +223,7 @@ def processZipFile(filename):
 		if config['esServer']:
 			# Save results to Elasticsearch
 			try:
-				response['@timestamp'] = buildTimestamp()
-				response['timestamp'] = response['@timestamp']
+				response = extendResponse(response, f, mailheaders)
 				res = es.index(index=config['esIndex'], doc_type=config['esDoctype'], body=json.dumps(response))
 			except:
 				writeLog("Cannot index to Elasticsearch")
@@ -257,8 +256,9 @@ def processZipFile(filename):
 	return
 
 def buildTimestamp():
-	#return time.strftime("%Y-%m-%dT%H:%M:%S+01:00")
-	#return time.strftime("%Y-%m-%dT%H:%M:%S.341Z")
+
+	"""Return a proper timestamp, one that fits creating new timebased ES indexes"""
+
 	return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime())
 
 def parseMailheaders(data):
@@ -290,6 +290,9 @@ def parseMailheaders(data):
 		return None
 
 def extendResponse(response, filename=None, mailheaders=None, MHN=True):
+
+	"""Extend reponse object with useful MHN data"""
+
 	if response:
 		response['@timestamp'] = buildTimestamp()
 		response['timestamp'] = response['@timestamp']
@@ -311,6 +314,17 @@ def extendResponse(response, filename=None, mailheaders=None, MHN=True):
 	else:
 		return None
 
+def cleanupUrlKey(d):
+
+	"""Replace dots in keynames"""
+	"""From: http://stackoverflow.com/questions/11700705/python-recursively-replace-character-in-keys-of-nested-dictionary/11700817#11700817"""
+
+	new = {}
+	for k, v in d.iteritems():
+		if isinstance(v, dict):
+			v = cleanupUrlKey(v)
+		new[k.replace('.', '-')] = v
+	return new
 
 
 def main():
@@ -399,10 +413,6 @@ def main():
 		writeLog("DEBUG: Found data: %s (%s)" % (contenttype, filename))
 		data = part.get_payload(None, True)
 		if data:
-			md5 = hashlib.md5(data).hexdigest()
-			if dbMD5Exists(md5):
-				writeLog("Skipping existing MD5 %s" % md5)
-				continue
 
 			# New: Extract URLS
 			if contenttype in [ 'text/html', 'text/plain' ]:
@@ -419,9 +429,27 @@ def main():
 					except:
 						pass
 				fp = open('/var/tmp/urls.log', 'a')
+				vt = VirusTotalPublicApi(config['apiKey'])
 				for url in urls:
+					response_badkeys = vt.get_url_report(url)
+					response = cleanupUrlKey(response_badkeys)
+
+					# Save results to Elasticsearch
+					if config['esServer']:
+						try:
+							response = extendResponse(response, "", mailheaders)
+							res = es.index(index=config['esIndex'], doc_type=config['esDoctype'], body=json.dumps(response))
+							writeLog("Submit ES")
+						except:
+							writeLog("Cannot index to Elasticsearch")
+
 					fp.write("%s\n" % url)
 				fp.close()
+
+			md5 = hashlib.md5(data).hexdigest()
+			if dbMD5Exists(md5):
+				writeLog("Skipping existing MD5 %s" % md5)
+				continue
 
 			# Process only interesting files
 			# if contenttype not in ('text/plain', 'text/html', 'image/jpeg', 'image/gif', 'image/png'):
@@ -445,7 +473,7 @@ def main():
 				if contenttype in ['application/zip', 'application/x-zip-compressed']:
 					# Process ZIP archive
 					writeLog('Processing zip archive: %s' % filename)
-					processZipFile(os.path.join(generateDumpDirectory(args.directory), filename))
+					processZipFile(os.path.join(generateDumpDirectory(args.directory), filename), mailheaders)
 				else:
 					# Check VT score
 					vt = VirusTotalPublicApi(config['apiKey'])
